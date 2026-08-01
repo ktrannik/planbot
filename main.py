@@ -1348,6 +1348,7 @@ def main():
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(CommandHandler("showmemes", show_memes))
     import signal
+    print("🤖 Бот запущен!")
 
     def handle_shutdown(signum, frame):
         print("\n🛑 Получен сигнал остановки (SIGTERM)")
@@ -1356,10 +1357,6 @@ def main():
 
     signal.signal(signal.SIGTERM, handle_shutdown)
 
-
-  
-    
-   print("🤖 Бот запущен!")
    try:
        app.run_polling()
    except KeyboardInterrupt:
