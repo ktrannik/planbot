@@ -71,6 +71,28 @@ def init_db():
     conn.close()
     print("✅ База данных готова")
 
+    # --- ТАБЛИЦА ПОЛЬЗОВАТЕЛЕЙ ДЛЯ РАССЫЛКИ ---
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+           chat_id TEXT PRIMARY KEY,
+           username TEXT,
+           first_seen TEXT,
+           last_seen TEXT
+        )
+    ''')
+
+def save_user(chat_id, username):
+    """Сохраняет пользователя в базу"""
+    conn = sqlite3.connect(QUIZZES_DB)
+    c = conn.cursor()
+    now = datetime.now().isoformat()
+    c.execute('''
+        INSERT OR REPLACE INTO users (chat_id, username, first_seen, last_seen)
+        VALUES (?, ?, COALESCE((SELECT first_seen FROM users WHERE chat_id = ?), ?), ?)
+    ''', (chat_id, username, chat_id, now, now))
+    conn.commit()
+    conn.close()
+
 # --- ФУНКЦИИ ДЛЯ ВИКТОРИН ---
 def save_scheduled(chat_id, username, question, options, correct_option_id, hashtag, file_id, publish_time):
     conn = sqlite3.connect(QUIZZES_DB)
@@ -230,6 +252,37 @@ def send_reminder(bot_token, chat_id, time_str):
         print(f"✅ Напоминание отправлено на {time_str}")
     except Exception as e:
         print(f"❌ Ошибка отправки напоминания: {e}")
+
+def get_all_users():
+    """Возвращает список всех chat_id"""
+    conn = sqlite3.connect(QUIZZES_DB)
+    c = conn.cursor()
+    c.execute('SELECT chat_id FROM users')
+    rows = c.fetchall()
+    conn.close()
+    return [row[0] for row in rows]
+
+def notify_all_users(bot_token, message):
+    """Отправляет сообщение всем пользователям"""
+    users = get_all_users()
+    if not users:
+        print("📭 Нет пользователей для уведомления")
+        return
+    
+    print(f"📤 Отправка уведомления {len(users)} пользователям...")
+    
+    for chat_id in users:
+        try:
+            url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+            requests.post(url, data={
+                "chat_id": chat_id,
+                "text": message,
+                "parse_mode": "HTML"
+            })
+            time.sleep(0.1)  # Чтобы не получить flood
+        except Exception as e:
+            print(f"❌ Не удалось отправить {chat_id}: {e}")
+            
 # --- ОТДЕЛЬНЫЙ ПОТОК ДЛЯ НАПОМИНАНИЙ ---
 def reminder_loop():
     """Отдельный поток для напоминаний о мемах (по времени UTC+2)"""
@@ -783,6 +836,9 @@ async def backup_base_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 # --- ОСНОВНОЙ ОБРАБОТЧИК ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.effective_user.id)
+    username = update.effective_user.username or "без_юзернейма"
+    save_user(chat_id, username)
     text = update.message.text
     print(f"📩 Текст: {text}")
     print(f"📍 Шаг: {context.user_data.get('step')}")
@@ -1291,10 +1347,27 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(CommandHandler("showmemes", show_memes))
+    import signal
+
+    def handle_shutdown(signum, frame):
+        print("\n🛑 Получен сигнал остановки (SIGTERM)")
+        notify_all_users(BOT_TOKEN, "🛑 Бот остановлен! Обновление или перезапуск. Скоро вернусь.")
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, handle_shutdown)
+
+
   
     
-    print("🤖 Бот запущен!")
-    app.run_polling()
+   print("🤖 Бот запущен!")
+   try:
+       app.run_polling()
+   except KeyboardInterrupt:
+       print("\n🛑 Бот остановлен (Ctrl+C)")
+       notify_all_users(BOT_TOKEN, "🛑 Бот остановлен! Обновление или перезапуск. Скоро вернусь.")
+   except Exception as e:
+       print(f"❌ Ошибка: {e}")
+       notify_all_users(BOT_TOKEN, f"❌ Бот упал с ошибкой: {e}")
 
 if __name__ == "__main__":
     main()
