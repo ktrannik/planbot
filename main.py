@@ -806,17 +806,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --- ТЕКСТ ДЛЯ МЕМА ---
     if step == 'waiting_for_meme_post_text':
         context.user_data['meme_post_text'] = text
-        context.user_data['step'] = 'waiting_for_meme_hashtag'
-        
+        context.user_data['step'] = 'waiting_for_meme_action'
+    
         keyboard = [
-            [InlineKeyboardButton("✅ Добавить #ФлудНаПМ", callback_data="meme_hashtag_add")],
-            [InlineKeyboardButton("⏭️ Пропустить", callback_data="meme_hashtag_skip")]
+           [InlineKeyboardButton("✅ Опубликовать сейчас", callback_data="meme_publish_now")],
+           [InlineKeyboardButton("⏰ Запланировать на время", callback_data="meme_schedule")],
+           [InlineKeyboardButton("❌ Отмена", callback_data="meme_cancel")]
         ]
-        
+    
         await update.message.reply_text(
             f"✅ Текст сохранён:\n\n{text}\n\n"
-            "📝 Добавить хэштег #ФлудНаПМ?",
-            reply_markup=InlineKeyboardMarkup(keyboard)
+            "Что делаем с мемом?",
+           reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return
     
