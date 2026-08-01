@@ -1357,14 +1357,14 @@ def main():
 
     signal.signal(signal.SIGTERM, handle_shutdown)
 
-   try:
-       app.run_polling()
-   except KeyboardInterrupt:
-       print("\n🛑 Бот остановлен (Ctrl+C)")
-       notify_all_users(BOT_TOKEN, "🛑 Бот остановлен! Обновление или перезапуск. Скоро вернусь.")
-   except Exception as e:
-       print(f"❌ Ошибка: {e}")
-       notify_all_users(BOT_TOKEN, f"❌ Бот упал с ошибкой: {e}")
+    try:
+        app.run_polling()
+    except KeyboardInterrupt:
+        print("\n🛑 Бот остановлен (Ctrl+C)")
+        notify_all_users(BOT_TOKEN, "🛑 Бот остановлен! Обновление или перезапуск. Скоро вернусь.")
+    except Exception as e:
+        print(f"❌ Ошибка: {e}")
+        notify_all_users(BOT_TOKEN, f"❌ Бот упал с ошибкой: {e}")
 
 if __name__ == "__main__":
     main()
