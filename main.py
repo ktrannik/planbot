@@ -67,9 +67,6 @@ def init_db():
             publish_time TEXT
         )
     ''')
-    conn.commit()
-    conn.close()
-    print("✅ База данных готова")
 
     # --- ТАБЛИЦА ПОЛЬЗОВАТЕЛЕЙ ДЛЯ РАССЫЛКИ ---
     c.execute('''
@@ -80,6 +77,9 @@ def init_db():
            last_seen TEXT
         )
     ''')
+    conn.commit()
+    conn.close()
+    print("✅ База данных готова")
 
 def save_user(chat_id, username):
     """Сохраняет пользователя в базу"""
