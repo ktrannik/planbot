@@ -24,6 +24,12 @@ HASHTAGS = [
     "#Тринадцать_огней", "#Последняя_реальность", "#Сердце_вселенной",
     "#Точка_невозврата", "#Мастерская_47", "#внесезонов"
 ]
+# --- ID ДЛЯ УВЕДОМЛЕНИЙ О ПАДЕНИИ ---
+ADMIN_IDS = [
+    "5206039766",  # твой ID
+    "123456789",   # второй админ
+    "987654321",   # третий админ
+]
 
 # --- БАЗА ДАННЫХ ---
 def init_db():
@@ -282,6 +288,27 @@ def notify_all_users(bot_token, message):
             time.sleep(0.1)  # Чтобы не получить flood
         except Exception as e:
             print(f"❌ Не удалось отправить {chat_id}: {e}")
+
+def self_health_check():
+    while True:
+        try:
+            conn = sqlite3.connect(QUIZZES_DB)
+            c = conn.cursor()
+            c.execute("SELECT 1")
+            conn.close()
+            print("✅ Бот жив")
+        except Exception as e:
+            # Отправляем ВСЕМ админам
+            for admin_id in ADMIN_IDS:
+                try:
+                    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+                    requests.post(url, data={
+                        "chat_id": admin_id,
+                        "text": f"⚠️ Бот сломался! Ошибка: {e}"
+                    })
+                except:
+                    pass
+        time.sleep(600)
             
 # --- ОТДЕЛЬНЫЙ ПОТОК ДЛЯ НАПОМИНАНИЙ ---
 def reminder_loop():
@@ -1319,6 +1346,11 @@ def main():
     reminder_thread = threading.Thread(target=reminder_loop, daemon=True)
     reminder_thread.start()
     print("⏰ Напоминалка запущена")
+
+    # --- ЗАПУСК САМОПРОВЕРКИ ---
+    health_thread = threading.Thread(target=self_health_check, daemon=True)
+    health_thread.start()
+    print("🩺 Самопроверка запущена (каждые 10 минут)")
     
     app = Application.builder().token(BOT_TOKEN).build()
     
