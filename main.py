@@ -5,9 +5,33 @@ import threading
 import sqlite3
 import shutil
 import os
-from datetime import datetime, timedelta
+import sys
+from datetime import datetime, timedelta, timezone
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+
+# --- МОСКОВСКОЕ ВРЕМЯ (UTC+3) ---
+MSK = timezone(timedelta(hours=3))
+
+def now_utc():
+    """Текущее время в UTC (не зависит от хостинга)"""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+def now_msk():
+    """Текущее время в МСК"""
+    return datetime.now(timezone.utc).astimezone(MSK)
+
+def utc_to_msk(dt_utc):
+    """UTC (naive) → МСК (naive)"""
+    if dt_utc is None:
+        return None
+    return dt_utc + timedelta(hours=3)
+
+def msk_to_utc(dt_msk):
+    """МСК (naive) → UTC (naive)"""
+    if dt_msk is None:
+        return None
+    return dt_msk - timedelta(hours=3)
 
 
 # --- КОНФИГИ ---
@@ -16,26 +40,23 @@ CHANNEL_ID = "@trassa993"
 SUGGESTION_LINK = "https://t.me/trassa993?direct"
 QUIZZES_DB = 'quizzes.db'
 BASE_QUIZZES_DB = 'basequizzes.db'
-# --- ID ПОЛЬЗОВАТЕЛЯ ДЛЯ НАПОМИНАНИЙ ---
-MEME_ADMIN_ID = "6607609864"  # ЗАМЕНИ НА РЕАЛЬНЫЙ CHAT_ID
+MEME_ADMIN_ID = "6607609864"
 
 HASHTAGS = [
     "#Новое_поколение", "#Игра_бога", "#Идеальный_мир", "#Голос_времени",
     "#Тринадцать_огней", "#Последняя_реальность", "#Сердце_вселенной",
     "#Точка_невозврата", "#Мастерская_47", "#внесезонов"
 ]
-# --- ID ДЛЯ УВЕДОМЛЕНИЙ О ПАДЕНИИ ---
 ADMIN_IDS = [
-    "5206039766",  # твой ID
-    "123456789",   # второй админ
-    "987654321",   # третий админ
+    "5206039766",
+    "123456789",
+    "987654321",
 ]
 
 # --- БАЗА ДАННЫХ ---
 def init_db():
     conn = sqlite3.connect(QUIZZES_DB)
     c = conn.cursor()
-    # История викторин
     c.execute('''
         CREATE TABLE IF NOT EXISTS quizzes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -46,7 +67,6 @@ def init_db():
             date TEXT
         )
     ''')
-    # Запланированные викторины
     c.execute('''
         CREATE TABLE IF NOT EXISTS scheduled (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -57,10 +77,10 @@ def init_db():
             correct_option_id INTEGER,
             hashtag TEXT,
             file_id TEXT,
-            publish_time TEXT
+            publish_time TEXT,
+            explanation TEXT
         )
     ''')
-    # Мемы
     c.execute('''
         CREATE TABLE IF NOT EXISTS memes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -73,8 +93,6 @@ def init_db():
             publish_time TEXT
         )
     ''')
-
-    # --- ТАБЛИЦА ПОЛЬЗОВАТЕЛЕЙ ДЛЯ РАССЫЛКИ ---
     c.execute('''
         CREATE TABLE IF NOT EXISTS users (
            chat_id TEXT PRIMARY KEY,
@@ -83,15 +101,18 @@ def init_db():
            last_seen TEXT
         )
     ''')
+    try:
+        c.execute('ALTER TABLE scheduled ADD COLUMN explanation TEXT')
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
     print("✅ База данных готова")
 
 def save_user(chat_id, username):
-    """Сохраняет пользователя в базу"""
     conn = sqlite3.connect(QUIZZES_DB)
     c = conn.cursor()
-    now = datetime.now().isoformat()
+    now = now_utc().isoformat()
     c.execute('''
         INSERT OR REPLACE INTO users (chat_id, username, first_seen, last_seen)
         VALUES (?, ?, COALESCE((SELECT first_seen FROM users WHERE chat_id = ?), ?), ?)
@@ -100,22 +121,22 @@ def save_user(chat_id, username):
     conn.close()
 
 # --- ФУНКЦИИ ДЛЯ ВИКТОРИН ---
-def save_scheduled(chat_id, username, question, options, correct_option_id, hashtag, file_id, publish_time):
+def save_scheduled(chat_id, username, question, options, correct_option_id, hashtag, file_id, publish_time_utc, explanation=None):
     conn = sqlite3.connect(QUIZZES_DB)
     c = conn.cursor()
     c.execute('''
-        INSERT INTO scheduled (chat_id, username, question, options, correct_option_id, hashtag, file_id, publish_time)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (chat_id, username, question, options, correct_option_id, hashtag, file_id, publish_time.isoformat()))
+        INSERT INTO scheduled (chat_id, username, question, options, correct_option_id, hashtag, file_id, publish_time, explanation)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (chat_id, username, question, options, correct_option_id, hashtag, file_id, publish_time_utc.isoformat(), explanation))
     conn.commit()
     conn.close()
 
 def get_due_quizzes():
     conn = sqlite3.connect(QUIZZES_DB)
     c = conn.cursor()
-    now = datetime.now().isoformat()
+    now = now_utc().isoformat()
     c.execute('''
-        SELECT id, chat_id, question, options, correct_option_id, hashtag, file_id, publish_time
+        SELECT id, chat_id, question, options, correct_option_id, hashtag, file_id, publish_time, explanation
         FROM scheduled WHERE publish_time <= ?
     ''', (now,))
     rows = c.fetchall()
@@ -170,21 +191,20 @@ def delete_user_scheduled(chat_id, quiz_id=None):
     conn.close()
 
 # --- ФУНКЦИИ ДЛЯ МЕМОВ ---
-# --- ФУНКЦИИ ДЛЯ МЕМОВ ---
-def save_meme(chat_id, username, file_id, file_type, hashtag, post_text, publish_time):
+def save_meme(chat_id, username, file_id, file_type, hashtag, post_text, publish_time_utc):
     conn = sqlite3.connect(QUIZZES_DB)
     c = conn.cursor()
     c.execute('''
         INSERT INTO memes (chat_id, username, file_id, file_type, hashtag, post_text, publish_time)
         VALUES (?, ?, ?, ?, ?, ?, ?)
-    ''', (chat_id, username, file_id, file_type, hashtag, post_text, publish_time.isoformat()))
+    ''', (chat_id, username, file_id, file_type, hashtag, post_text, publish_time_utc.isoformat()))
     conn.commit()
     conn.close()
 
 def get_due_memes():
     conn = sqlite3.connect(QUIZZES_DB)
     c = conn.cursor()
-    now = datetime.now().isoformat()
+    now = now_utc().isoformat()
     c.execute('''
         SELECT id, chat_id, file_id, file_type, hashtag, publish_time
         FROM memes WHERE publish_time <= ?
@@ -221,32 +241,37 @@ def delete_user_memes(chat_id, meme_id=None):
     conn.close()
 
 # --- НАПОМИНАЛКА ---
-def get_today_memes_by_time(chat_id, target_hour, target_minute):
-    """Проверяет, запланирован ли мем на конкретное время сегодня (UTC)"""
+def get_today_memes_by_time_msk(chat_id, target_hour_msk, target_minute_msk):
+    """Проверяет, запланирован ли мем на конкретное МСК-время сегодня"""
+    # Переводим МСК-время в UTC-диапазон
+    now_msk_dt = now_msk()
+    today_msk_start = now_msk_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_msk_end = now_msk_dt.replace(hour=23, minute=59, second=59, microsecond=999999)
+
+    # Целевое МСК-время сегодня
+    target_msk = now_msk_dt.replace(hour=target_hour_msk, minute=target_minute_msk, second=0, microsecond=0)
+    # В UTC
+    target_utc = msk_to_utc(target_msk.replace(tzinfo=None))
+
+    # Диапазон ± 30 сек (на случай секунд)
+    start_utc = (target_utc - timedelta(seconds=30)).isoformat()
+    end_utc = (target_utc + timedelta(seconds=30)).isoformat()
+
+    print(f"🔍 ИЩУ В БД: chat_id={chat_id}, МСК={target_hour_msk:02d}:{target_minute_msk:02d} → UTC-диапазон [{start_utc} .. {end_utc}]")
+
     conn = sqlite3.connect(QUIZZES_DB)
     c = conn.cursor()
-    
-    # Ищем по UTC (без сдвигов)
-    now_utc = datetime.now()
-    today_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-    today_end = now_utc.replace(hour=23, minute=59, second=59, microsecond=999999).isoformat()
-
-    print(f"🔍 ИЩУ В БД: chat_id={chat_id}, time={target_hour:02d}:{target_minute:02d} UTC")
-    print(f"📅 today_start={today_start}, today_end={today_end}")
-    
     c.execute('''
         SELECT id FROM memes 
         WHERE chat_id = ? 
         AND publish_time >= ? 
         AND publish_time <= ?
-        AND publish_time LIKE ?
-    ''', (chat_id, today_start, today_end, f'%{target_hour:02d}:{target_minute:02d}%'))
+    ''', (chat_id, start_utc, end_utc))
     rows = c.fetchall()
     conn.close()
     return rows
 
 def send_reminder(bot_token, chat_id, time_str):
-    """Отправляет напоминание пользователю"""
     try:
         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
         text = f"⚠️ **Напоминание!**\n\nТы ещё не запланировал мем!\n\n🖼️ Используй `/meme` чтобы создать и запланировать мем."
@@ -260,7 +285,6 @@ def send_reminder(bot_token, chat_id, time_str):
         print(f"❌ Ошибка отправки напоминания: {e}")
 
 def get_all_users():
-    """Возвращает список всех chat_id"""
     conn = sqlite3.connect(QUIZZES_DB)
     c = conn.cursor()
     c.execute('SELECT chat_id FROM users')
@@ -269,14 +293,11 @@ def get_all_users():
     return [row[0] for row in rows]
 
 def notify_all_users(bot_token, message):
-    """Отправляет сообщение всем пользователям"""
     users = get_all_users()
     if not users:
         print("📭 Нет пользователей для уведомления")
         return
-    
     print(f"📤 Отправка уведомления {len(users)} пользователям...")
-    
     for chat_id in users:
         try:
             url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
@@ -285,7 +306,7 @@ def notify_all_users(bot_token, message):
                 "text": message,
                 "parse_mode": "HTML"
             })
-            time.sleep(0.1)  # Чтобы не получить flood
+            time.sleep(0.1)
         except Exception as e:
             print(f"❌ Не удалось отправить {chat_id}: {e}")
 
@@ -298,7 +319,6 @@ def self_health_check():
             conn.close()
             print("✅ Бот жив")
         except Exception as e:
-            # Отправляем ВСЕМ админам
             for admin_id in ADMIN_IDS:
                 try:
                     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -309,56 +329,40 @@ def self_health_check():
                 except:
                     pass
         time.sleep(600)
-            
+
 # --- ОТДЕЛЬНЫЙ ПОТОК ДЛЯ НАПОМИНАНИЙ ---
 def reminder_loop():
-    """Отдельный поток для напоминаний о мемах (по времени UTC+2)"""
+    """Напоминалки по МСК"""
     while True:
         try:
-            now_utc = datetime.now()
-            
-            # --- ТВОЁ ВРЕМЯ (UTC+2) ---
-            now_user = now_utc + timedelta(hours=2)
-            current_hour = now_user.hour
-            current_minute = now_user.minute
-            today_str = now_user.strftime('%Y-%m-%d')
+            now_msk_dt = now_msk()
+            current_hour = now_msk_dt.hour
+            current_minute = now_msk_dt.minute
 
-              # --- ОТЛАДКА: ВСЁ ПИШЕТ В ЛОГИ ---
-            print(f"🔄 Проверка: {current_hour:02d}:{current_minute:02d}")
-            
-            # --- НАПОМИНАЛКИ (ПО ТВОЕМУ ВРЕМЕНИ UTC+2) ---
+            print(f"🔄 Проверка (МСК): {current_hour:02d}:{current_minute:02d}")
+
             reminder_times = [
-                {"hour": 16, "minute": 30, "start_remind": 16, "start_minute": 5},  # 17:30 по твоему времени
-                {"hour": 17, "minute": 30, "start_remind": 17, "start_minute": 5}, 
-                {"hour": 18, "minute": 30, "start_remind": 18, "start_minute": 5}, # 18:30 по твоему времени
-                # 19:30 по твоему времени
+                {"hour": 16, "minute": 30, "start_remind": 16, "start_minute": 5},
+                {"hour": 17, "minute": 30, "start_remind": 17, "start_minute": 5},
+                {"hour": 18, "minute": 30, "start_remind": 18, "start_minute": 5},
             ]
-            
+
             for rt in reminder_times:
-                # Проверяем, что сейчас время для напоминания (по твоему времени)
-                print(f"🔍 Проверка условия: {current_hour} == {rt['start_remind']} and {rt['start_minute']} <= {current_minute} <= {rt['start_minute'] + 20}")
                 if current_hour == rt["start_remind"] and rt["start_minute"] <= current_minute <= rt["start_minute"] + 20:
-                    
-                    # --- ПЕРЕВОДИМ ТВОЁ ВРЕМЯ В UTC (ДЛЯ ПОИСКА В БД) ---
-                    # Твоё 17:30 → UTC 15:30 (вычитаем 2 часа)
-                    utc_hour = (rt["hour"] - 2) % 24
-                    utc_minute = rt["minute"]
-                    
-                    # Проверяем, есть ли уже мем на это время сегодня
-                    existing = get_today_memes_by_time(MEME_ADMIN_ID, utc_hour, utc_minute)
+                    existing = get_today_memes_by_time_msk(MEME_ADMIN_ID, rt["hour"], rt["minute"])
                     print(f"📊 Найдено мемов в БД: {len(existing)}")
                     if not existing:
                         if current_minute % 5 == 0:
                             send_reminder(
-                                BOT_TOKEN, 
-                                MEME_ADMIN_ID, 
-                                f"{rt['hour']:02d}:{rt['minute']:02d} (по твоему времени)"
+                                BOT_TOKEN,
+                                MEME_ADMIN_ID,
+                                f"{rt['hour']:02d}:{rt['minute']:02d} МСК"
                             )
-                            print(f"⏰ Напоминание отправлено на {rt['hour']:02d}:{rt['minute']:02d}")
-            
+                            print(f"⏰ Напоминание отправлено на {rt['hour']:02d}:{rt['minute']:02d} МСК")
+
         except Exception as e:
             print(f"❌ Ошибка в напоминалке: {e}")
-        
+
         time.sleep(60)
 
 # --- ФОНОВЫЙ ПОТОК ---
@@ -368,12 +372,12 @@ def scheduler_loop():
             # --- ПРОВЕРКА ВИКТОРИН ---
             due = get_due_quizzes()
             for row in due:
-                quiz_id, chat_id, question, options, correct_option_id, hashtag, file_id, publish_time = row
+                quiz_id, chat_id, question, options, correct_option_id, hashtag, file_id, publish_time, explanation = row
                 options_list = options.split('|||') if options else []
-                
+
                 try:
                     caption = f"Викторина\n{hashtag}\n\n<a href=\"{SUGGESTION_LINK}\">ТрясЛо №993 | Скинуть что-нибудь в предложку</a>"
-                    
+
                     url_photo = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
                     requests.post(url_photo, data={
                         "chat_id": CHANNEL_ID,
@@ -381,34 +385,38 @@ def scheduler_loop():
                         "caption": caption,
                         "parse_mode": "HTML"
                     })
-                    
+
                     url_poll = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPoll"
-                    resp = requests.post(url_poll, json={
+                    poll_data = {
                         "chat_id": CHANNEL_ID,
                         "question": question,
                         "options": options_list,
                         "type": "quiz",
                         "correct_option_id": correct_option_id,
                         "is_anonymous": True
-                    })
-                    
+                    }
+                    if explanation:
+                        poll_data["explanation"] = explanation
+                        poll_data["explanation_parse_mode"] = "HTML"
+                    resp = requests.post(url_poll, json=poll_data)
+
                     if resp.json().get('ok'):
                         print(f"✅ Опубликовано: {question[:30]}...")
                     else:
                         print(f"❌ Ошибка: {resp.json()}")
-                    
+
                     delete_scheduled(quiz_id)
-                    
+
                 except Exception as e:
                     print(f"❌ Ошибка публикации: {e}")
-            
+
             # --- ПРОВЕРКА МЕМОВ ---
             due_memes = get_due_memes()
             for row in due_memes:
                 meme_id, chat_id, file_id, file_type, hashtag, publish_time = row
                 try:
                     caption = f"Мем\n{hashtag}\n\n<a href=\"{SUGGESTION_LINK}\">ТрясЛо №993 | Скинуть что-нибудь в предложку</a>"
-                    
+
                     if file_type == 'photo':
                         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
                         requests.post(url, data={
@@ -425,55 +433,57 @@ def scheduler_loop():
                             "caption": caption,
                             "parse_mode": "HTML"
                         })
-                    
+
                     print(f"✅ Мем опубликован: {hashtag}")
                     delete_meme(meme_id)
-                    
+
                 except Exception as e:
                     print(f"❌ Ошибка публикации мема: {e}")
-                    
+
         except Exception as e:
             print(f"❌ Ошибка в планировщике: {e}")
-        
+
         time.sleep(10)
 
 # --- ПАРСИНГИ ---
 def parse_datetime(text):
-    now = datetime.now()
-    
-    # --- ТОЛЬКО ВРЕМЯ (20:33) ---
-    match = re.search(r'(\d{1,2}):(\d{2})', text)
-    if match and not re.search(r'\d{1,2}\.\d{1,2}', text):
-        hour, minute = int(match.group(1)), int(match.group(2))
-        dt = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        if dt < now:
-            dt = dt + timedelta(days=1)
-        dt = dt - timedelta(hours=3)
-        return dt
-    
-    # --- ДАТА + ВРЕМЯ (08.07 20:33) ---
-    match = re.search(r'(\d{1,2})\.(\d{1,2})\s+(\d{1,2}):(\d{2})', text)
-    if match:
-        day, month, hour, minute = int(match.group(1)), int(match.group(2)), int(match.group(3)), int(match.group(4))
-        dt = datetime(now.year, month, day, hour, minute)
-        # Если дата уже прошла в этом году — добавляем год
-        if dt < now:
-            # Проверяем, не сегодня ли это (тогда добавляем день)
-            if dt.date() == now.date():
-                dt = dt + timedelta(days=1)
-            else:
-                dt = dt.replace(year=now.year + 1)
-        dt = dt - timedelta(hours=3)
-        return dt
-    
-    # --- ДАТА + ВРЕМЯ С ГОДОМ (08.07.2026 20:33) ---
+    """
+    Парсит время от пользователя в МСК и возвращает UTC (naive).
+    Поддерживает:
+      - 20:33 (только время — сегодня/завтра по МСК)
+      - 08.07 20:33 (дата + время)
+      - 08.07.2026 20:33 (дата + год + время)
+    """
+    now_msk_dt = now_msk().replace(tzinfo=None)
+
+    # --- ДАТА + ВРЕМЯ С ГОДОМ ---
     match = re.search(r'(\d{1,2})\.(\d{1,2})\.(\d{4})\s+(\d{1,2}):(\d{2})', text)
     if match:
-        day, month, year, hour, minute = int(match.group(1)), int(match.group(2)), int(match.group(3)), int(match.group(4)), int(match.group(5))
-        dt = datetime(year, month, day, hour, minute)
-        dt = dt - timedelta(hours=3)
-        return dt
-    
+        day, month, year, hour, minute = map(int, match.groups())
+        dt_msk = datetime(year, month, day, hour, minute)
+        return msk_to_utc(dt_msk)
+
+    # --- ДАТА + ВРЕМЯ ---
+    match = re.search(r'(\d{1,2})\.(\d{1,2})\s+(\d{1,2}):(\d{2})', text)
+    if match:
+        day, month, hour, minute = map(int, match.groups())
+        dt_msk = datetime(now_msk_dt.year, month, day, hour, minute)
+        if dt_msk < now_msk_dt:
+            if dt_msk.date() == now_msk_dt.date():
+                dt_msk = dt_msk + timedelta(days=1)
+            else:
+                dt_msk = dt_msk.replace(year=now_msk_dt.year + 1)
+        return msk_to_utc(dt_msk)
+
+    # --- ТОЛЬКО ВРЕМЯ ---
+    match = re.search(r'(\d{1,2}):(\d{2})', text)
+    if match:
+        hour, minute = int(match.group(1)), int(match.group(2))
+        dt_msk = now_msk_dt.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if dt_msk < now_msk_dt:
+            dt_msk = dt_msk + timedelta(days=1)
+        return msk_to_utc(dt_msk)
+
     return None
 
 def parse_quiz(text):
@@ -518,20 +528,20 @@ def save_base_quiz(question, options, correct_option_id):
     c.execute('''
         INSERT INTO base_quizzes (question, options, correct_option_id, date)
         VALUES (?, ?, ?, ?)
-    ''', (question, options, correct_option_id, datetime.now().isoformat()))
+    ''', (question, options, correct_option_id, now_utc().isoformat()))
     conn.commit()
     conn.close()
 
 def backup_base_quizzes():
     if os.path.exists(BASE_QUIZZES_DB):
-        backup_name = f"base_quizzes_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+        backup_name = f"base_quizzes_backup_{now_msk().strftime('%Y%m%d_%H%M%S')}.db"
         shutil.copy2(BASE_QUIZZES_DB, backup_name)
         return backup_name
     return None
 
 def backup_quizzes():
     if os.path.exists(QUIZZES_DB):
-        backup_name = f"quizzes_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+        backup_name = f"quizzes_backup_{now_msk().strftime('%Y%m%d_%H%M%S')}.db"
         shutil.copy2(QUIZZES_DB, backup_name)
         return backup_name
     return None
@@ -558,8 +568,9 @@ async def my_quizzes(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     reply = "📋 **Твои запланированные викторины:**\n\n"
     for idx, (quiz_id, question, publish_time) in enumerate(scheduled, 1):
-        dt = datetime.fromisoformat(publish_time) + timedelta(hours=3)
-        reply += f"{idx}. {question[:40]}... → {dt.strftime('%d.%m %H:%M')}\n"
+        dt_utc = datetime.fromisoformat(publish_time)
+        dt_msk = utc_to_msk(dt_utc)
+        reply += f"{idx}. {question[:40]}... → {dt_msk.strftime('%d.%m %H:%M')} МСК\n"
         reply += f"   🆔 {quiz_id} | /cancel {quiz_id}\n\n"
     await update.message.reply_text(reply)
 
@@ -625,8 +636,8 @@ async def view_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = scheduled[0][1]
         reply = f"📋 **Викторины @{username}** (`{chat_id}`):\n\n"
         for idx, (quiz_id, _, question, publish_time) in enumerate(scheduled, 1):
-            dt = datetime.fromisoformat(publish_time) + timedelta(hours=3)
-            reply += f"{idx}. {question[:50]}... → {dt.strftime('%d.%m %H:%M')}\n"
+            dt_msk = utc_to_msk(datetime.fromisoformat(publish_time))
+            reply += f"{idx}. {question[:50]}... → {dt_msk.strftime('%d.%m %H:%M')} МСК\n"
             reply += f"   🆔 {quiz_id}\n\n"
         await update.message.reply_text(reply)
         return
@@ -638,8 +649,8 @@ async def view_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         username = scheduled[0][1] if scheduled else "без_юзернейма"
         reply = f"📋 **Викторины @{username}** (`{target}`):\n\n"
         for idx, (quiz_id, _, question, publish_time) in enumerate(scheduled, 1):
-            dt = datetime.fromisoformat(publish_time) + timedelta(hours=3)
-            reply += f"{idx}. {question[:50]}... → {dt.strftime('%d.%m %H:%M')}\n"
+            dt_msk = utc_to_msk(datetime.fromisoformat(publish_time))
+            reply += f"{idx}. {question[:50]}... → {dt_msk.strftime('%d.%m %H:%M')} МСК\n"
             reply += f"   🆔 {quiz_id}\n\n"
         await update.message.reply_text(reply)
         return
@@ -656,10 +667,8 @@ async def start_meme(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_meme_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get('step') != 'waiting_for_meme_media':
         return
-    
     file_id = None
     file_type = None
-    
     if update.message.photo:
         file_id = update.message.photo[-1].file_id
         file_type = 'photo'
@@ -669,11 +678,9 @@ async def handle_meme_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❌ Отправь картинку или видео.")
         return
-    
     context.user_data['meme_file_id'] = file_id
     context.user_data['meme_file_type'] = file_type
     context.user_data['step'] = 'waiting_for_meme_hashtag'
-    
     keyboard = [
         [InlineKeyboardButton("#мемло", callback_data="meme_h_memlo")],
         [InlineKeyboardButton("#линчфд", callback_data="meme_h_newgen")],
@@ -681,12 +688,10 @@ async def handle_meme_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("#неошафд", callback_data="meme_h_ideal")],
         [InlineKeyboardButton("✏️ Свой", callback_data="meme_h_custom")],
     ]
-    
     await update.message.reply_text(
         "🏷️ Выбери основной хэштег для мема:",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
-
 
 async def meme_button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -736,7 +741,6 @@ async def meme_button_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             )
         except Exception as e:
             await query.edit_message_text(f"❌ Ошибка: {e}")
-
         context.user_data.clear()
         return
 
@@ -753,12 +757,11 @@ async def meme_button_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 async def handle_meme_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get('step') != 'waiting_for_meme_time':
         return
-    dt = parse_datetime(update.message.text)
-    if dt is None:
+    dt_utc = parse_datetime(update.message.text)
+    if dt_utc is None:
         await update.message.reply_text("❌ Не понял формат. Пример: `20:33`")
         return
-    now = datetime.now()
-    if dt < now:
+    if dt_utc < now_utc():
         await update.message.reply_text("❌ Время уже прошло!")
         return
     chat_id = str(update.effective_user.id)
@@ -767,10 +770,10 @@ async def handle_meme_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_type = context.user_data.get('meme_file_type')
     hashtag = context.user_data.get('meme_hashtag', '#мемло')
     post_text = context.user_data.get('meme_post_text')
-    save_meme(chat_id, username, file_id, file_type, hashtag, post_text, dt)
-    print(f"✅ МЕМ СОХРАНЁН В БД: {dt.isoformat()}, chat_id: {chat_id}")
-    msk_time = (dt + timedelta(hours=3)).strftime('%d.%m.%Y в %H:%M')
-    delay = int((dt - now).total_seconds())
+    save_meme(chat_id, username, file_id, file_type, hashtag, post_text, dt_utc)
+    print(f"✅ МЕМ СОХРАНЁН В БД (UTC): {dt_utc.isoformat()}, chat_id: {chat_id}")
+    msk_time = utc_to_msk(dt_utc).strftime('%d.%m.%Y в %H:%M')
+    delay = int((dt_utc - now_utc()).total_seconds())
     await update.message.reply_text(
         f"✅ Мем запланирован на **{msk_time}** МСК!\n"
         f"⏳ Осталось: {delay} сек\n"
@@ -778,7 +781,7 @@ async def handle_meme_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📝 {post_text if post_text else 'Без текста'}"
     )
     context.user_data.clear()
-    
+
 async def my_memes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_user.id)
     memes = get_user_memes(chat_id)
@@ -787,8 +790,8 @@ async def my_memes(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     reply = "📋 **Твои запланированные мемы:**\n\n"
     for idx, (meme_id, file_type, hashtag, publish_time) in enumerate(memes, 1):
-        dt = datetime.fromisoformat(publish_time) + timedelta(hours=3)
-        reply += f"{idx}. {file_type} | {hashtag} → {dt.strftime('%d.%m %H:%M')}\n"
+        dt_msk = utc_to_msk(datetime.fromisoformat(publish_time))
+        reply += f"{idx}. {file_type} | {hashtag} → {dt_msk.strftime('%d.%m %H:%M')} МСК\n"
         reply += f"   🆔 {meme_id} | /cancelmeme {meme_id}\n\n"
     await update.message.reply_text(reply)
 
@@ -841,13 +844,6 @@ async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
-async def base_quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['step'] = 'waiting_for_base_quiz_text'
-    await update.message.reply_text(
-        "📝 Отправь вопрос в формате:\n"
-        "`Вопрос (Вариант 1; Вариант 2*; Вариант 3; Вариант 4)`"
-    )
-
 async def backup_base_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("💾 Создаю бэкап базы вопросов...")
     try:
@@ -872,74 +868,53 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         await update.message.reply_text("❌ Отправь текст")
         return
-    
+
     step = context.user_data.get('step')
-    
-    # --- БАЗОВЫЙ ВОПРОС ---
-    if step == 'waiting_for_base_quiz_text':
-        parsed = parse_quiz(text)
-        if parsed and len(parsed['options']) >= 2:
-            save_base_quiz(parsed['question'], '|||'.join(parsed['options']), parsed['correct_option_id'])
-            await update.message.reply_text(f"✅ Вопрос сохранён!\n❓ {parsed['question']}")
-        else:
-            await update.message.reply_text("❌ Неправильный формат.\nНужно: `Вопрос (А; Б*; В; Г)`")
-        context.user_data['step'] = None
-        return
-    
-    # --- ТЕКСТ ДЛЯ МЕМА ---
+
     if step == 'waiting_for_meme_post_text':
         context.user_data['meme_post_text'] = text
         context.user_data['step'] = 'waiting_for_meme_action'
-    
         keyboard = [
            [InlineKeyboardButton("✅ Опубликовать сейчас", callback_data="meme_publish_now")],
            [InlineKeyboardButton("⏰ Запланировать на время", callback_data="meme_schedule")],
            [InlineKeyboardButton("❌ Отмена", callback_data="meme_cancel")]
         ]
-    
         await update.message.reply_text(
             f"✅ Текст сохранён:\n\n{text}\n\n"
             "Что делаем с мемом?",
            reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return
-    
-    # --- ВРЕМЯ ДЛЯ МЕМА ---
+
     if step == 'waiting_for_meme_time':
         await handle_meme_time(update, context)
         return
 
-    # --- СВОЙ ХЭШТЕГ ДЛЯ МЕМА ---
     if step == 'waiting_for_meme_custom_hashtag':
         text = text.strip()
         if not text.startswith('#'):
             text = '#' + text
         context.user_data['meme_hashtag'] = text
-        context.user_data['step'] = 'waiting_for_meme_text'
-    
+        context.user_data['step'] = 'waiting_for_meme_flud'
         keyboard = [
-            [InlineKeyboardButton("✅ Добавить текст", callback_data="meme_text_yes")],
-            [InlineKeyboardButton("⏭️ Без текста", callback_data="meme_text_no")]
+            [InlineKeyboardButton("✅ Добавить #ФлудНаПМ", callback_data="meme_flud_yes")],
+            [InlineKeyboardButton("⏭️ Пропустить", callback_data="meme_flud_no")]
         ]
-    
         await update.message.reply_text(
-            f"✅ Хэштег: {text}\n\n📝 Добавить текст к мему?",
+            f"✅ Хэштег: {text}\n\n📝 Добавить хэштег #ФлудНаПМ?",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return
-      
-    # --- ТЕКСТ ВИКТОРИНЫ ---
+
     if step == 'waiting_for_quiz_text':
         parsed = parse_quiz(text)
         if parsed and len(parsed['options']) >= 2:
             context.user_data['quiz_data'] = parsed
             context.user_data['step'] = 'waiting_for_hashtag'
-            
             keyboard = []
             for hashtag in HASHTAGS:
                 keyboard.append([InlineKeyboardButton(hashtag, callback_data=f"hashtag_{hashtag}")])
             keyboard.append([InlineKeyboardButton("✏️ Свой", callback_data="hashtag_custom")])
-            
             await update.message.reply_text(
                 f"❓ {parsed['question']}\n"
                 f"✅ Правильный ответ: {parsed['options'][parsed['correct_option_id']]}\n\n"
@@ -949,56 +924,59 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text("❌ Неправильный формат. Пример: `Вопрос (А; Б*; В; Г)`")
         return
-    
-    # --- ВРЕМЯ ДЛЯ ВИКТОРИНЫ ---
+
+    if step == 'waiting_for_explanation':
+        explanation = text.strip()
+        context.user_data['quiz_explanation'] = explanation
+        context.user_data['step'] = 'waiting_for_time'
+        await update.message.reply_text(
+            f"✅ Объяснение сохранено:\n\n{explanation}\n\n"
+            "📅 **Укажи время публикации** (МСК):\nНапример: `20:33` или `08.07 20:33`"
+        )
+        return
+
     if step == 'waiting_for_time':
-        dt = parse_datetime(text)
-        if dt is None:
+        dt_utc = parse_datetime(text)
+        if dt_utc is None:
             await update.message.reply_text("❌ Не понял формат. Пример: `20:33` или `08.07 20:33`")
             return
-        
-        now = datetime.now()
-        if dt < now:
+        if dt_utc < now_utc():
             await update.message.reply_text("❌ Время уже прошло! Укажи будущее время.")
             return
-        
-        context.user_data['publish_time'] = dt
+        context.user_data['publish_time'] = dt_utc
         context.user_data['step'] = 'waiting_for_confirmation'
-        
-        delay = int((dt - now).total_seconds())
-        msk_time = (dt + timedelta(hours=3)).strftime('%d.%m.%Y в %H:%M')
-        
+        delay = int((dt_utc - now_utc()).total_seconds())
+        msk_time = utc_to_msk(dt_utc).strftime('%d.%m.%Y в %H:%M')
         keyboard = [
             [InlineKeyboardButton("✅ Запланировать", callback_data="confirm_publish")],
             [InlineKeyboardButton("❌ Отмена", callback_data="cancel_publish")]
         ]
-        
+        explanation = context.user_data.get('quiz_explanation')
+        explanation_line = f"\n📖 Объяснение: {explanation[:50]}..." if explanation else "\n📖 Без объяснения"
         await update.message.reply_text(
             f"📅 **Публикация:** {msk_time} МСК\n"
             f"⏳ **Осталось:** {delay} сек\n\n"
             f"❓ {context.user_data['quiz_data']['question']}\n"
-            f"🏷️ {context.user_data['quiz_hashtag']}\n\n"
+            f"🏷️ {context.user_data['quiz_hashtag']}"
+            f"{explanation_line}\n\n"
             "✅ Подтверждаешь?",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return
-    
-    # --- СВОЙ ХЭШТЕГ ---
+
     if step == 'waiting_for_custom_hashtag':
         text = text.strip()
         if not text.startswith('#'):
             text = '#' + text
         context.user_data['quiz_hashtag'] = text
         context.user_data['step'] = 'waiting_for_image'
-        
         await update.message.reply_text(
             f"✅ Хэштег: {text}\n\n"
             "🖼️ Отправь картинку для поста.\n\n"
             "После картинки выбери действие."
         )
         return
-    
-    # --- ЛЮБОЙ ДРУГОЙ ТЕКСТ ---
+
     await update.message.reply_text(
         "❓ Я не понял.\n\n"
         "Команды:\n"
@@ -1011,31 +989,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/id — мой ID\n"
         "/view @username — викторины пользователя"
     )
+
 # --- КНОПКИ ---
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
     print(f"🔘 Нажата кнопка: {data}")
-    
-    
-    # --- КНОПКИ МЕМА ---
+
     if data in ["meme_publish_now", "meme_schedule", "meme_cancel"]:
         await meme_button_callback(update, context)
         return
-    
-    # --- ВЫБОР ХЭШТЕГА (ДЛЯ ВИКТОРИНЫ) ---
+
     if data.startswith("hashtag_"):
         hashtag = data.replace("hashtag_", "")
-        
         if hashtag == "custom":
             await query.edit_message_text("✏️ Напиши свой хэштег (например, #МойХэштег)")
             context.user_data['step'] = 'waiting_for_custom_hashtag'
             return
-        
         context.user_data['quiz_hashtag'] = hashtag
         context.user_data['step'] = 'waiting_for_image'
-        
         await query.edit_message_text(
             f"✅ Хэштег: {hashtag}\n\n"
             "🖼️ Отправь картинку для поста.\n\n"
@@ -1043,17 +1016,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # --- ВЫБОР ХЭШТЕГА ДЛЯ МЕМА ---
-    # --- ВЫБОР ХЭШТЕГА ДЛЯ МЕМА ---
     if data.startswith("meme_h_"):
         hashtag = data.replace("meme_h_", "")
-     
         if hashtag == "custom":
             context.user_data['step'] = 'waiting_for_meme_custom_hashtag'
             await query.edit_message_text("✏️ Напиши свой хэштег (например, #МойХэштег)")
             return
-    
-    # Сохраняем основной хэштег
         hashtag_map = {
             "memlo": "#мемло",
             "newgen": "#линчфд",
@@ -1061,10 +1029,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "ideal": "#неошафд",
         }
         context.user_data['meme_hashtag'] = hashtag_map.get(hashtag, "#" + hashtag)
-    
         await query.edit_message_text(f"✅ Основной хэштег: {context.user_data['meme_hashtag']}")
-    
-         # --- СПРАШИВАЕМ ПРО #ФлудНаПМ ---
         context.user_data['step'] = 'waiting_for_meme_flud'
         keyboard = [
             [InlineKeyboardButton("✅ Добавить #ФлудНаПМ", callback_data="meme_flud_yes")],
@@ -1075,12 +1040,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return
-    # --- ДОБАВИТЬ #ФлудНаПМ ---
+
     if data == "meme_flud_yes":
-        context.user_data['meme_flud'] = "#ФлудНаПМ"
+        existing = context.user_data.get('meme_hashtag', '')
+        context.user_data['meme_hashtag'] = existing + " #ФлудНаПМ"
         await query.edit_message_text("✅ Хэштег #ФлудНаПМ добавлен!")
         context.user_data['step'] = 'waiting_for_meme_text'
-    
         keyboard = [
             [InlineKeyboardButton("✅ Добавить текст", callback_data="meme_text_yes")],
             [InlineKeyboardButton("⏭️ Без текста", callback_data="meme_text_no")]
@@ -1092,10 +1057,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "meme_flud_no":
-        context.user_data['meme_flud'] = None
         await query.edit_message_text("⏭️ #ФлудНаПМ пропущен.")
         context.user_data['step'] = 'waiting_for_meme_text'
-    
         keyboard = [
             [InlineKeyboardButton("✅ Добавить текст", callback_data="meme_text_yes")],
             [InlineKeyboardButton("⏭️ Без текста", callback_data="meme_text_no")]
@@ -1106,10 +1069,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-
-    
-    # --- ТЕКСТ ДЛЯ МЕМА ---
-    # --- ТЕКСТ ДЛЯ МЕМА ---
     if data == "meme_text_yes":
         context.user_data['step'] = 'waiting_for_meme_post_text'
         await query.edit_message_text(
@@ -1121,39 +1080,61 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "meme_text_no":
         context.user_data['meme_post_text'] = None
         context.user_data['step'] = 'waiting_for_meme_action'
-        
         keyboard = [
             [InlineKeyboardButton("✅ Опубликовать сейчас", callback_data="meme_publish_now")],
             [InlineKeyboardButton("⏰ Запланировать на время", callback_data="meme_schedule")],
             [InlineKeyboardButton("❌ Отмена", callback_data="meme_cancel")]
         ]
-        
         await query.edit_message_text(
             "⏭️ Без текста.\n\nЧто делаем с мемом?",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return
-    
-    # --- ЗАПЛАНИРОВАТЬ (ДЛЯ ВИКТОРИНЫ) ---
+
     if data == "schedule":
-        context.user_data['step'] = 'waiting_for_time'
-        await query.edit_message_text("📅 **Укажи время публикации** (МСК):\nНапример: `20:33`")
+        context.user_data['step'] = 'waiting_for_explanation_choice'
+        keyboard = [
+            [InlineKeyboardButton("✅ Добавить объяснение", callback_data="explanation_yes")],
+            [InlineKeyboardButton("⏭️ Без объяснения", callback_data="explanation_no")]
+        ]
+        await query.edit_message_text(
+            "📖 Добавить объяснение правильного ответа?\n\n"
+            "Оно появится у пользователя после ответа на викторину.",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
         return
-    
-    # --- ПОДТВЕРЖДЕНИЕ ПУБЛИКАЦИИ (ДЛЯ ВИКТОРИНЫ) ---
+
+    if data == "explanation_yes":
+        context.user_data['step'] = 'waiting_for_explanation'
+        await query.edit_message_text(
+            "📖 Напиши объяснение правильного ответа.\n\n"
+            "Оно появится у пользователя после ответа."
+        )
+        return
+
+    if data == "explanation_no":
+        context.user_data['quiz_explanation'] = None
+        context.user_data['step'] = 'waiting_for_time'
+        await query.edit_message_text(
+            "⏭️ Без объяснения.\n\n"
+            "📅 **Укажи время публикации** (МСК):\nНапример: `20:33` или `08.07 20:33`"
+        )
+        return
+
     if data == "confirm_publish":
         chat_id = str(update.effective_user.id)
         username = update.effective_user.username or "без_юзернейма"
         quiz_data = context.user_data.get('quiz_data')
         hashtag = context.user_data.get('quiz_hashtag')
         file_id = context.user_data.get('file_id')
-        publish_time = context.user_data.get('publish_time')
-        
-        if not quiz_data or not hashtag or not file_id or not publish_time:
+        publish_time_utc = context.user_data.get('publish_time')
+        explanation = context.user_data.get('quiz_explanation')
+
+        if not quiz_data or not hashtag or not file_id or not publish_time_utc:
             await query.edit_message_text("❌ Ошибка. Начни заново через /quiz")
             context.user_data.clear()
             return
-        
+
         save_scheduled(
             chat_id,
             username,
@@ -1162,37 +1143,38 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             quiz_data['correct_option_id'],
             hashtag,
             file_id,
-            publish_time
+            publish_time_utc,
+            explanation
         )
-        
-        msk_time = (publish_time + timedelta(hours=3)).strftime('%d.%m.%Y в %H:%M')
-        delay = int((publish_time - datetime.now()).total_seconds())
-        
+
+        msk_time = utc_to_msk(publish_time_utc).strftime('%d.%m.%Y в %H:%M')
+        delay = int((publish_time_utc - now_utc()).total_seconds())
+        explanation_line = f"\n📖 Объяснение: {explanation[:50]}..." if explanation else "\n📖 Без объяснения"
         await query.edit_message_text(
             f"✅ Викторина запланирована на **{msk_time}** МСК!\n"
             f"⏳ Осталось: {delay} сек\n"
-            f"🏷️ {hashtag}\n"
+            f"🏷️ {hashtag}"
+            f"{explanation_line}\n"
             "📋 /my — посмотреть все"
         )
         context.user_data.clear()
         return
-    
-    # --- МОМЕНТАЛЬНАЯ ПУБЛИКАЦИЯ (ДЛЯ ВИКТОРИНЫ) ---
+
     if data == "publish_now":
         quiz_data = context.user_data.get('quiz_data')
         hashtag = context.user_data.get('quiz_hashtag')
         file_id = context.user_data.get('file_id')
-        
+        explanation = context.user_data.get('quiz_explanation')
+
         if not quiz_data or not hashtag or not file_id:
             await query.edit_message_text("❌ Ошибка. Начни заново через /quiz")
             context.user_data.clear()
             return
-        
+
         await query.edit_message_text("📤 Публикую викторину сейчас...")
-        
+
         try:
             caption = f"Викторина\n{hashtag}\n\n<a href=\"{SUGGESTION_LINK}\">ТрясЛо №993 | Скинуть что-нибудь в предложку</a>"
-            
             url_photo = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
             requests.post(url_photo, data={
                 "chat_id": CHANNEL_ID,
@@ -1200,27 +1182,29 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "caption": caption,
                 "parse_mode": "HTML"
             })
-            
             url_poll = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPoll"
-            resp = requests.post(url_poll, json={
+            poll_data = {
                 "chat_id": CHANNEL_ID,
                 "question": quiz_data['question'],
                 "options": quiz_data['options'],
                 "type": "quiz",
                 "correct_option_id": quiz_data['correct_option_id'],
                 "is_anonymous": True
-            })
-            
+            }
+            if explanation:
+                poll_data["explanation"] = explanation
+                poll_data["explanation_parse_mode"] = "HTML"
+            resp = requests.post(url_poll, json=poll_data)
+
             if resp.json().get('ok'):
                 conn = sqlite3.connect(QUIZZES_DB)
                 c = conn.cursor()
                 c.execute('''
                     INSERT INTO quizzes (question, options, correct_option_id, hashtag, date)
                     VALUES (?, ?, ?, ?, ?)
-                ''', (quiz_data['question'], '|||'.join(quiz_data['options']), quiz_data['correct_option_id'], hashtag, datetime.now().isoformat()))
+                ''', (quiz_data['question'], '|||'.join(quiz_data['options']), quiz_data['correct_option_id'], hashtag, now_utc().isoformat()))
                 conn.commit()
                 conn.close()
-                
                 await query.edit_message_text(
                     f"✅ Викторина ОПУБЛИКОВАНА!\n\n"
                     f"❓ {quiz_data['question']}\n"
@@ -1228,19 +1212,16 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             else:
                 await query.edit_message_text(f"❌ Ошибка: {resp.json()}")
-                
         except Exception as e:
             await query.edit_message_text(f"❌ Ошибка: {e}")
-        
         context.user_data.clear()
         return
-    
-    # --- ОТМЕНА ---
+
     if data == "cancel_publish":
         await query.edit_message_text("❌ Отменено.")
         context.user_data.clear()
         return
-    
+
     await query.edit_message_text("❌ Неизвестная команда.")
 
 # --- КАРТИНКА ДЛЯ ВИКТОРИНЫ ---
@@ -1250,24 +1231,17 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message.photo:
         await update.message.reply_text("❌ Отправь именно картинку")
         return
-    
     photo = update.message.photo[-1]
     context.user_data['file_id'] = photo.file_id
-    
-    # Получаем данные
     hashtag = context.user_data.get('quiz_hashtag')
     quiz_data = context.user_data.get('quiz_data')
-    
-    # Формируем подпись БЕЗ текста
     caption = f"Викторина\n{hashtag}\n\n<a href=\"{SUGGESTION_LINK}\">ТрясЛо №993 | Скинуть что-нибудь в предложку</a>"
     context.user_data['caption'] = caption
-    
     keyboard = [
         [InlineKeyboardButton("✅ Опубликовать сейчас", callback_data="publish_now")],
         [InlineKeyboardButton("⏰ Запланировать на время", callback_data="schedule")],
         [InlineKeyboardButton("❌ Отмена", callback_data="cancel_publish")]
     ]
-    
     await update.message.reply_text(
         f"🖼️ Картинка сохранена!\n\n"
         f"❓ {quiz_data['question'] if quiz_data else '?'}\n"
@@ -1276,69 +1250,55 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
-
 async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает фото и видео для викторин и мемов"""
     step = context.user_data.get('step')
-    
-    # Если ждём картинку для викторины
     if step == 'waiting_for_image':
         if not update.message.photo:
             await update.message.reply_text("❌ Для викторины нужна именно картинка (фото).")
             return
         await handle_image(update, context)
         return
-    
-    # Если ждём медиа для мема
     if step == 'waiting_for_meme_media':
         if not update.message.photo and not update.message.video:
             await update.message.reply_text("❌ Для мема нужна картинка или видео.")
             return
         await handle_meme_media(update, context)
         return
-    
-    # Если ничего не ждём
     await update.message.reply_text("❌ Я не жду медиа. Используй /quiz или /meme чтобы начать.")
 
 async def show_memes(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает все мемы в БД"""
     conn = sqlite3.connect(QUIZZES_DB)
     c = conn.cursor()
     c.execute('SELECT id, chat_id, publish_time, hashtag FROM memes ORDER BY id DESC LIMIT 10')
     rows = c.fetchall()
     conn.close()
-    
     if not rows:
         await update.message.reply_text("📭 В БД нет мемов.")
         return
-    
     reply = "📋 **Последние 10 мемов в БД:**\n\n"
     for row in rows:
+        dt_msk = utc_to_msk(datetime.fromisoformat(row[2]))
         reply += f"🆔 {row[0]}\n"
-        reply += f"📅 {row[2]}\n"
+        reply += f"📅 {dt_msk.strftime('%d.%m %H:%M')} МСК\n"
         reply += f"🏷️ {row[3]}\n"
         reply += f"👤 {row[1]}\n\n"
-    
     await update.message.reply_text(reply)
 
 async def testrem(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Проверяет, видит ли бот мемы на 15:30 UTC"""
     hour = 17
     minute = 40
-    await update.message.reply_text(f"🔍 Проверяю мемы на {hour:02d}:{minute:02d} UTC...")
-    
-    existing = get_today_memes_by_time(MEME_ADMIN_ID, hour, minute)
-    
+    await update.message.reply_text(f"🔍 Проверяю мемы на {hour:02d}:{minute:02d} МСК...")
+    existing = get_today_memes_by_time_msk(MEME_ADMIN_ID, hour, minute)
     if existing:
         await update.message.reply_text(f"✅ НАЙДЕНО {len(existing)} МЕМОВ! Напоминалка НЕ должна прийти.")
     else:
         await update.message.reply_text("❌ МЕМОВ НЕ НАЙДЕНО. Напоминалка ПРИДЁТ.")
-        
+
 # --- ЗАПУСК ---
 def main():
     init_db()
     init_base_db()
-    
+
     scheduler_thread = threading.Thread(target=scheduler_loop, daemon=True)
     scheduler_thread.start()
     print("🔄 Планировщик запущен")
@@ -1347,13 +1307,12 @@ def main():
     reminder_thread.start()
     print("⏰ Напоминалка запущена")
 
-    # --- ЗАПУСК САМОПРОВЕРКИ ---
     health_thread = threading.Thread(target=self_health_check, daemon=True)
     health_thread.start()
     print("🩺 Самопроверка запущена (каждые 10 минут)")
-    
+
     app = Application.builder().token(BOT_TOKEN).build()
-    
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("quiz", start_quiz))
     app.add_handler(CommandHandler("meme", start_meme))
@@ -1368,17 +1327,14 @@ def main():
     app.add_handler(CommandHandler("id", get_id))
     app.add_handler(CommandHandler("view", view_command))
     app.add_handler(CommandHandler("backup", backup_command))
-    app.add_handler(CommandHandler("basequiz", base_quiz_command))
     app.add_handler(CommandHandler("backupbase", backup_base_command))
     app.add_handler(CommandHandler("testrem", testrem))
-    
-      # --- МЕДИА (фото и видео) - ТОЛЬКО ОДИН! ---
+
     app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO, handle_media))
-    
-    # --- ТЕКСТ (только ОДИН!) ---
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(CommandHandler("showmemes", show_memes))
+
     import signal
     print("🤖 Бот запущен!")
 
