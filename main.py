@@ -243,21 +243,14 @@ def delete_user_memes(chat_id, meme_id=None):
 # --- НАПОМИНАЛКА ---
 def get_today_memes_by_time_msk(chat_id, target_hour_msk, target_minute_msk):
     """Проверяет, запланирован ли мем на конкретное МСК-время сегодня"""
-    # Переводим МСК-время в UTC-диапазон
     now_msk_dt = now_msk()
-    today_msk_start = now_msk_dt.replace(hour=0, minute=0, second=0, microsecond=0)
-    today_msk_end = now_msk_dt.replace(hour=23, minute=59, second=59, microsecond=999999)
-
-    # Целевое МСК-время сегодня
     target_msk = now_msk_dt.replace(hour=target_hour_msk, minute=target_minute_msk, second=0, microsecond=0)
-    # В UTC
     target_utc = msk_to_utc(target_msk.replace(tzinfo=None))
 
-    # Диапазон ± 30 сек (на случай секунд)
     start_utc = (target_utc - timedelta(seconds=30)).isoformat()
     end_utc = (target_utc + timedelta(seconds=30)).isoformat()
 
-    print(f"🔍 ИЩУ В БД: chat_id={chat_id}, МСК={target_hour_msk:02d}:{target_minute_msk:02d} → UTC-диапазон [{start_utc} .. {end_utc}]")
+    print(f"🔍 ИЩУ В БД: chat_id={chat_id}, МСК={target_hour_msk:02d}:{target_minute_msk:02d} → UTC [{start_utc} .. {end_utc}]")
 
     conn = sqlite3.connect(QUIZZES_DB)
     c = conn.cursor()
@@ -330,9 +323,8 @@ def self_health_check():
                     pass
         time.sleep(600)
 
-# --- ОТДЕЛЬНЫЙ ПОТОК ДЛЯ НАПОМИНАНИЙ ---
+# --- НАПОМИНАЛКИ ---
 def reminder_loop():
-    """Напоминалки по МСК"""
     while True:
         try:
             now_msk_dt = now_msk()
@@ -396,7 +388,7 @@ def scheduler_loop():
                         "is_anonymous": True
                     }
                     if explanation:
-                        poll_data["explanation"] = explanation
+                        poll_data["explanation"] = explanation[:200]
                         poll_data["explanation_parse_mode"] = "HTML"
                     resp = requests.post(url_poll, json=poll_data)
 
@@ -449,21 +441,20 @@ def scheduler_loop():
 def parse_datetime(text):
     """
     Парсит время от пользователя в МСК и возвращает UTC (naive).
-    Поддерживает:
-      - 20:33 (только время — сегодня/завтра по МСК)
-      - 08.07 20:33 (дата + время)
-      - 08.07.2026 20:33 (дата + год + время)
+      - 20:33 (только время)
+      - 08.07 20:33
+      - 08.07.2026 20:33
     """
     now_msk_dt = now_msk().replace(tzinfo=None)
 
-    # --- ДАТА + ВРЕМЯ С ГОДОМ ---
+    # Дата + время с годом
     match = re.search(r'(\d{1,2})\.(\d{1,2})\.(\d{4})\s+(\d{1,2}):(\d{2})', text)
     if match:
         day, month, year, hour, minute = map(int, match.groups())
         dt_msk = datetime(year, month, day, hour, minute)
         return msk_to_utc(dt_msk)
 
-    # --- ДАТА + ВРЕМЯ ---
+    # Дата + время
     match = re.search(r'(\d{1,2})\.(\d{1,2})\s+(\d{1,2}):(\d{2})', text)
     if match:
         day, month, hour, minute = map(int, match.groups())
@@ -475,7 +466,7 @@ def parse_datetime(text):
                 dt_msk = dt_msk.replace(year=now_msk_dt.year + 1)
         return msk_to_utc(dt_msk)
 
-    # --- ТОЛЬКО ВРЕМЯ ---
+    # Только время
     match = re.search(r'(\d{1,2}):(\d{2})', text)
     if match:
         hour, minute = int(match.group(1)), int(match.group(2))
@@ -487,13 +478,29 @@ def parse_datetime(text):
     return None
 
 def parse_quiz(text):
-    match = re.match(r'^(.+?)\s*\((.+)\)\s*$', text.strip())
+    """
+    Парсит викторину. Формат:
+        Вопрос (А; Б*; В; Г)
+        Объяснение (необязательно, на той же или следующей строке)
+    Правильный ответ помечен *.
+    """
+    text = text.strip()
+
+    match = re.match(r'^(.*?)\s*\((.+?)\)\s*(.*)$', text, re.DOTALL)
     if not match:
         return None
-    question = match.group(1).strip()
-    options = [opt.strip() for opt in match.group(2).split(';') if opt.strip()]
+
+    question_part = match.group(1).strip()
+    options_part = match.group(2).strip()
+    explanation = match.group(3).strip() or None
+
+    if not question_part:
+        return None
+
+    options = [opt.strip() for opt in options_part.split(';') if opt.strip()]
     if len(options) < 2:
         return None
+
     correct_option_id = None
     cleaned = []
     for i, opt in enumerate(options):
@@ -502,9 +509,16 @@ def parse_quiz(text):
             cleaned.append(opt[:-1].strip())
         else:
             cleaned.append(opt)
+
     if correct_option_id is None:
         correct_option_id = 0
-    return {"question": question, "options": cleaned, "correct_option_id": correct_option_id}
+
+    return {
+        "question": question_part,
+        "options": cleaned,
+        "correct_option_id": correct_option_id,
+        "explanation": explanation,
+    }
 
 def init_base_db():
     conn = sqlite3.connect(BASE_QUIZZES_DB)
@@ -521,16 +535,6 @@ def init_base_db():
     conn.commit()
     conn.close()
     print("✅ База базовых вопросов готова")
-
-def save_base_quiz(question, options, correct_option_id):
-    conn = sqlite3.connect(BASE_QUIZZES_DB)
-    c = conn.cursor()
-    c.execute('''
-        INSERT INTO base_quizzes (question, options, correct_option_id, date)
-        VALUES (?, ?, ?, ?)
-    ''', (question, options, correct_option_id, now_utc().isoformat()))
-    conn.commit()
-    conn.close()
 
 def backup_base_quizzes():
     if os.path.exists(BASE_QUIZZES_DB):
@@ -612,9 +616,14 @@ async def cancel_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['step'] = 'waiting_for_quiz_text'
     await update.message.reply_text(
-        "📝 Отправь в формате:\n"
+        "📝 Отправь в формате:\n\n"
         "`Вопрос (Вариант 1; Вариант 2*; Вариант 3; Вариант 4)`\n"
-        "Где * — правильный ответ"
+        "`Объяснение (необязательно)`\n\n"
+        "Пример:\n"
+        "`Как зовут чела? (А*; Б; В; Г)`\n"
+        "`А потому что он Вася`\n\n"
+        "Где * — правильный ответ.\n"
+        "Всё, что после скобок — объяснение, которое появится после ответа на викторину (макс. 200 символов)."
     )
 
 async def get_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -911,28 +920,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if parsed and len(parsed['options']) >= 2:
             context.user_data['quiz_data'] = parsed
             context.user_data['step'] = 'waiting_for_hashtag'
+
             keyboard = []
             for hashtag in HASHTAGS:
                 keyboard.append([InlineKeyboardButton(hashtag, callback_data=f"hashtag_{hashtag}")])
             keyboard.append([InlineKeyboardButton("✏️ Свой", callback_data="hashtag_custom")])
+
+            explanation_line = ""
+            if parsed.get('explanation'):
+                expl = parsed['explanation']
+                expl_short = expl[:80] + ('...' if len(expl) > 80 else '')
+                explanation_line = f"\n📖 Объяснение: {expl_short}"
+
             await update.message.reply_text(
                 f"❓ {parsed['question']}\n"
-                f"✅ Правильный ответ: {parsed['options'][parsed['correct_option_id']]}\n\n"
+                f"✅ Правильный ответ: {parsed['options'][parsed['correct_option_id']]}"
+                f"{explanation_line}\n\n"
                 "🏷️ Выбери хэштег:",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
         else:
-            await update.message.reply_text("❌ Неправильный формат. Пример: `Вопрос (А; Б*; В; Г)`")
-        return
-
-    if step == 'waiting_for_explanation':
-        explanation = text.strip()
-        context.user_data['quiz_explanation'] = explanation
-        context.user_data['step'] = 'waiting_for_time'
-        await update.message.reply_text(
-            f"✅ Объяснение сохранено:\n\n{explanation}\n\n"
-            "📅 **Укажи время публикации** (МСК):\nНапример: `20:33` или `08.07 20:33`"
-        )
+            await update.message.reply_text(
+                "❌ Неправильный формат.\n\n"
+                "Пример:\n"
+                "`Как зовут чела? (А*; Б; В; Г)`\n"
+                "`А потому что он Вася`\n\n"
+                "Или в одну строку:\n"
+                "`Как зовут чела? (А*; Б; В; Г) А потому что он Вася`\n\n"
+                "Где * — правильный ответ, а текст после скобок — объяснение (необязательно)."
+            )
         return
 
     if step == 'waiting_for_time':
@@ -951,7 +967,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("✅ Запланировать", callback_data="confirm_publish")],
             [InlineKeyboardButton("❌ Отмена", callback_data="cancel_publish")]
         ]
-        explanation = context.user_data.get('quiz_explanation')
+        explanation = context.user_data['quiz_data'].get('explanation')
         explanation_line = f"\n📖 Объяснение: {explanation[:50]}..." if explanation else "\n📖 Без объяснения"
         await update.message.reply_text(
             f"📅 **Публикация:** {msk_time} МСК\n"
@@ -1092,31 +1108,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "schedule":
-        context.user_data['step'] = 'waiting_for_explanation_choice'
-        keyboard = [
-            [InlineKeyboardButton("✅ Добавить объяснение", callback_data="explanation_yes")],
-            [InlineKeyboardButton("⏭️ Без объяснения", callback_data="explanation_no")]
-        ]
-        await query.edit_message_text(
-            "📖 Добавить объяснение правильного ответа?\n\n"
-            "Оно появится у пользователя после ответа на викторину.",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        return
-
-    if data == "explanation_yes":
-        context.user_data['step'] = 'waiting_for_explanation'
-        await query.edit_message_text(
-            "📖 Напиши объяснение правильного ответа.\n\n"
-            "Оно появится у пользователя после ответа."
-        )
-        return
-
-    if data == "explanation_no":
-        context.user_data['quiz_explanation'] = None
         context.user_data['step'] = 'waiting_for_time'
         await query.edit_message_text(
-            "⏭️ Без объяснения.\n\n"
             "📅 **Укажи время публикации** (МСК):\nНапример: `20:33` или `08.07 20:33`"
         )
         return
@@ -1128,7 +1121,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         hashtag = context.user_data.get('quiz_hashtag')
         file_id = context.user_data.get('file_id')
         publish_time_utc = context.user_data.get('publish_time')
-        explanation = context.user_data.get('quiz_explanation')
+        explanation = quiz_data.get('explanation') if quiz_data else None
 
         if not quiz_data or not hashtag or not file_id or not publish_time_utc:
             await query.edit_message_text("❌ Ошибка. Начни заново через /quiz")
@@ -1164,7 +1157,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         quiz_data = context.user_data.get('quiz_data')
         hashtag = context.user_data.get('quiz_hashtag')
         file_id = context.user_data.get('file_id')
-        explanation = context.user_data.get('quiz_explanation')
+        explanation = quiz_data.get('explanation') if quiz_data else None
 
         if not quiz_data or not hashtag or not file_id:
             await query.edit_message_text("❌ Ошибка. Начни заново через /quiz")
@@ -1192,7 +1185,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "is_anonymous": True
             }
             if explanation:
-                poll_data["explanation"] = explanation
+                poll_data["explanation"] = explanation[:200]
                 poll_data["explanation_parse_mode"] = "HTML"
             resp = requests.post(url_poll, json=poll_data)
 
@@ -1242,10 +1235,13 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("⏰ Запланировать на время", callback_data="schedule")],
         [InlineKeyboardButton("❌ Отмена", callback_data="cancel_publish")]
     ]
+    explanation = quiz_data.get('explanation') if quiz_data else None
+    explanation_line = f"\n📖 Объяснение: {explanation[:60]}..." if explanation else "\n📖 Без объяснения"
     await update.message.reply_text(
         f"🖼️ Картинка сохранена!\n\n"
         f"❓ {quiz_data['question'] if quiz_data else '?'}\n"
-        f"🏷️ {hashtag}\n\n"
+        f"🏷️ {hashtag}"
+        f"{explanation_line}\n\n"
         "Что делаем?",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
