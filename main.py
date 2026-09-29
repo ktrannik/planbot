@@ -334,7 +334,7 @@ def reminder_loop():
             print(f"🔄 Проверка (МСК): {current_hour:02d}:{current_minute:02d}")
 
             reminder_times = [
-                {"hour": 21, "minute": 00, "start_remind": 22, "start_minute": 15},
+                {"hour": 20, "minute": 30, "start_remind": 20, "start_minute": 15},
                 {"hour": 17, "minute": 30, "start_remind": 17, "start_minute": 5},
                 {"hour": 18, "minute": 30, "start_remind": 18, "start_minute": 5},
             ]
