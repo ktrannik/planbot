@@ -206,7 +206,7 @@ def get_due_memes():
     c = conn.cursor()
     now = now_utc().isoformat()
     c.execute('''
-        SELECT id, chat_id, file_id, file_type, hashtag, publish_time
+        SELECT id, chat_id, file_id, file_type, hashtag, post_text, publish_time
         FROM memes WHERE publish_time <= ?
     ''', (now,))
     rows = c.fetchall()
@@ -358,6 +358,7 @@ def reminder_loop():
         time.sleep(60)
 
 # --- ФОНОВЫЙ ПОТОК ---
+# --- ФОНОВЫЙ ПОТОК ---
 def scheduler_loop():
     while True:
         try:
@@ -405,9 +406,12 @@ def scheduler_loop():
             # --- ПРОВЕРКА МЕМОВ ---
             due_memes = get_due_memes()
             for row in due_memes:
-                meme_id, chat_id, file_id, file_type, hashtag, publish_time = row
+                meme_id, chat_id, file_id, file_type, hashtag, post_text, publish_time = row
                 try:
-                    caption = f"Мем\n{hashtag}\n\n<a href=\"{SUGGESTION_LINK}\">ТрясЛо №993 | Скинуть что-нибудь в предложку</a>"
+                    caption = f"Мем\n{hashtag}"
+                    if post_text:
+                        caption += f"\n\n{post_text}"
+                    caption += f"\n\n<a href=\"{SUGGESTION_LINK}\">ТрясЛо №993 | Скинуть что-нибудь в предложку</a>"
 
                     if file_type == 'photo':
                         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
