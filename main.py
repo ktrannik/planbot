@@ -40,7 +40,7 @@ CHANNEL_ID = "@trassa993"
 SUGGESTION_LINK = "https://t.me/trassa993?direct"
 QUIZZES_DB = 'quizzes.db'
 BASE_QUIZZES_DB = 'basequizzes.db'
-MEME_ADMIN_ID = "5206039766"
+MEME_ADMIN_ID = "6607609864"
 
 HASHTAGS = [
     "#Новое_поколение", "#Игра_бога", "#Идеальный_мир", "#Голос_времени",
@@ -334,9 +334,9 @@ def reminder_loop():
             print(f"🔄 Проверка (МСК): {current_hour:02d}:{current_minute:02d}")
 
             reminder_times = [
-                {"hour": 20, "minute": 30, "start_remind": 20, "start_minute": 15},
                 {"hour": 17, "minute": 30, "start_remind": 17, "start_minute": 5},
                 {"hour": 18, "minute": 30, "start_remind": 18, "start_minute": 5},
+                {"hour": 19, "minute": 30, "start_remind": 19, "start_minute": 5},
             ]
 
             for rt in reminder_times:
